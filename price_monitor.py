@@ -1,22 +1,20 @@
-# price_monitor.py
 import os
 import json
 import time
+import asyncio
 import logging
 import logging.handlers
 from datetime import datetime
 from typing import Dict, Any
 
-import requests
 from telegram import Bot
 from dotenv import load_dotenv
+from playwright.async_api import async_playwright
 
-# Загружаем переменные окружения
 load_dotenv()
 
 class PriceMonitor:
     def __init__(self):
-        # Конфигурация
         self.config = {
             'token': os.getenv('TELEGRAM_BOT_TOKEN'),
             'chat_id': os.getenv('TELEGRAM_CHAT_ID'),
@@ -28,24 +26,21 @@ class PriceMonitor:
             'data_file': 'data.json',
         }
 
-        # Настройка логирования
         self.setup_logging()
-        
-        # Инициализация бота
         self.bot = Bot(token=self.config['token'])
+        self.browser = None
+        self.context = None
+        self.page = None
         
         self.logger.info("Price monitor initialized with config: %s", 
                         {k: v for k, v in self.config.items() if k != 'token'})
 
     def setup_logging(self):
-        """Настройка системы логирования с ротацией"""
         self.logger = logging.getLogger('PriceMonitor')
         self.logger.setLevel(logging.INFO)
-
-        # Создаем папку для логов если её нет
+        
         os.makedirs('logs', exist_ok=True)
-
-        # Хендлер для ротации логов
+        
         handler = logging.handlers.TimedRotatingFileHandler(
             'logs/price_monitor.log',
             when='midnight',
@@ -54,10 +49,8 @@ class PriceMonitor:
             encoding='utf-8'
         )
         
-        # Хендлер для вывода в консоль
         console_handler = logging.StreamHandler()
         
-        # Форматирование логов
         formatter = logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
@@ -67,8 +60,19 @@ class PriceMonitor:
         self.logger.addHandler(handler)
         self.logger.addHandler(console_handler)
 
+    async def setup_browser(self):
+        """Инициализация браузера"""
+        if not self.browser:
+            playwright = await async_playwright().start()
+            self.browser = await playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox']
+            )
+            self.context = await self.browser.new_context()
+            self.page = await self.context.new_page()
+            self.logger.info("Browser initialized")
+
     def load_data(self) -> Dict[str, Any]:
-        """Загрузка последних сохраненных данных"""
         try:
             with open(self.config['data_file'], 'r') as f:
                 return json.load(f)
@@ -82,7 +86,6 @@ class PriceMonitor:
             }
 
     def save_data(self, data: Dict[str, Any]):
-        """Сохранение данных в файл"""
         try:
             with open(self.config['data_file'], 'w') as f:
                 json.dump(data, f, indent=2)
@@ -90,46 +93,58 @@ class PriceMonitor:
         except Exception as e:
             self.logger.error("Error saving data: %s", e)
 
-    def fetch_token_data(self) -> Dict[str, Any]:
-        """Получение данных о токене через GraphQL API"""
+    async def fetch_token_data(self) -> Dict[str, Any]:
+        """Получение данных о токене через GraphQL"""
         try:
-            response = requests.post(
-                "https://zapper.xyz/z/graphql",
-                headers={
-                    "content-type": "application/json",
-                    "apollographql-client-name": "web-relay"
-                },
-                json={
-                    "query": """
-                        query TokenPrice($address: Address!, $network: Network!) {
-                            fungibleToken(address: $address, network: $network) {
-                                symbol
-                                name
-                                onchainMarketData {
-                                    price
-                                    marketCap
+            # Ждем пока Cloudflare пропустит
+            response = await self.page.evaluate("""
+                async () => {
+                    const response = await fetch("https://zapper.xyz/z/graphql", {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'apollographql-client-name': 'web-relay'
+                        },
+                        body: JSON.stringify({
+                            query: `
+                                query TokenPrice($address: Address!, $network: Network!) {
+                                    fungibleToken(address: $address, network: $network) {
+                                        symbol
+                                        name
+                                        onchainMarketData {
+                                            price
+                                            marketCap
+                                        }
+                                    }
                                 }
+                            `,
+                            variables: {
+                                "address": "0x96db3e22fdac25c0dff1cab92ae41a697406db7d",
+                                "network": "SHAPE_MAINNET"
                             }
-                        }
-                    """,
-                    "variables": {
-                        "address": self.config['token_address'],
-                        "network": self.config['network']
-                    }
+                        })
+                    });
+                    return response.json();
                 }
-            )
-            response.raise_for_status()
-            return response.json()['data']['fungibleToken']
+            """)
+            
+            if 'errors' in response:
+                raise Exception(f"GraphQL errors: {response['errors']}")
+                
+            return response['data']['fungibleToken']
+            
         except Exception as e:
             self.logger.error("Error fetching token data: %s", e)
+            # Сохраняем скриншот для отладки
+            try:
+                await self.page.screenshot(path='error_screenshot.png')
+                self.logger.info("Error screenshot saved")
+                self.logger.error("Page content: %s", await self.page.content())
+            except:
+                pass
             raise
 
-    def calculate_percentage_change(self, current: float, previous: float) -> float:
-        """Расчет процентного изменения"""
-        return 0 if previous == 0 else ((current - previous) / previous) * 100
-
     async def send_notification(self, message: str):
-        """Отправка уведомления в Telegram"""
         try:
             await self.bot.send_message(
                 chat_id=self.config['chat_id'],
@@ -141,15 +156,24 @@ class PriceMonitor:
             self.logger.error("Error sending notification: %s", e)
 
     async def check_price_changes(self):
-        """Проверка изменений цены и market cap"""
         try:
+            if not self.page:
+                await self.setup_browser()
+            
+            # Загружаем страницу и ждем пока Cloudflare пропустит
+            url = f"https://zapper.xyz/token/shape/{self.config['token_address']}/O/details"
+            await self.page.goto(url, wait_until='networkidle')
+            await self.page.wait_for_load_state('networkidle')
+            
+            # Небольшая пауза для полной загрузки
+            await asyncio.sleep(5)
+            
             previous_data = self.load_data()
-            token_data = self.fetch_token_data()
+            token_data = await self.fetch_token_data()
             
             current_price = token_data['onchainMarketData']['price']
             current_market_cap = token_data['onchainMarketData']['marketCap']
 
-            # Расчет изменений от последнего уведомления
             price_change = self.calculate_percentage_change(
                 current_price,
                 previous_data['last_notification_price'] or current_price
@@ -167,7 +191,6 @@ class PriceMonitor:
                 price_change, mcap_change
             )
 
-            # Проверка необходимости отправки уведомления
             should_notify = False
             notification_message = f"<b>{token_data['name']} ({token_data['symbol']}) Update</b>\n\n"
 
@@ -183,7 +206,6 @@ class PriceMonitor:
 
             if should_notify:
                 await self.send_notification(notification_message)
-                # Обновляем точку отсчета
                 self.save_data({
                     'price': current_price,
                     'market_cap': current_market_cap,
@@ -192,7 +214,6 @@ class PriceMonitor:
                     'last_update': datetime.now().isoformat()
                 })
             else:
-                # Сохраняем текущие значения без обновления точки отсчета
                 self.save_data({
                     **previous_data,
                     'price': current_price,
@@ -202,10 +223,29 @@ class PriceMonitor:
 
         except Exception as e:
             self.logger.error("Error in check cycle: %s", e)
+            # Пересоздаем браузер в случае ошибки
+            try:
+                await self.cleanup()
+            except:
+                pass
             raise
 
+    def calculate_percentage_change(self, current: float, previous: float) -> float:
+        return 0 if previous == 0 else ((current - previous) / previous) * 100
+
+    async def cleanup(self):
+        """Очистка ресурсов браузера"""
+        if self.page:
+            await self.page.close()
+        if self.context:
+            await self.context.close()
+        if self.browser:
+            await self.browser.close()
+        self.page = None
+        self.context = None
+        self.browser = None
+
     async def run(self):
-        """Основной цикл работы бота"""
         self.logger.info("Starting price monitor...")
         
         while True:
@@ -214,10 +254,18 @@ class PriceMonitor:
                 await asyncio.sleep(self.config['check_interval'])
             except Exception as e:
                 self.logger.error("Error in main loop: %s", e)
-                await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
+                await asyncio.sleep(60)
+
+    async def __aenter__(self):
+        await self.setup_browser()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.cleanup()
+
+async def main():
+    async with PriceMonitor() as monitor:
+        await monitor.run()
 
 if __name__ == "__main__":
-    import asyncio
-    
-    monitor = PriceMonitor()
-    asyncio.run(monitor.run())
+    asyncio.run(main())
