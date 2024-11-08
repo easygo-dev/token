@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, Any
 
 import requests
-from telegram.ext import Updater
+from telegram import Bot
 from dotenv import load_dotenv
 
 # Загружаем переменные окружения
@@ -32,7 +32,7 @@ class PriceMonitor:
         self.setup_logging()
         
         # Инициализация бота
-        self.bot = Updater(token=self.config['token']).bot
+        self.bot = Bot(token=self.config['token'])
         
         self.logger.info("Price monitor initialized with config: %s", 
                         {k: v for k, v in self.config.items() if k != 'token'})
@@ -128,10 +128,10 @@ class PriceMonitor:
         """Расчет процентного изменения"""
         return 0 if previous == 0 else ((current - previous) / previous) * 100
 
-    def send_notification(self, message: str):
+    async def send_notification(self, message: str):
         """Отправка уведомления в Telegram"""
         try:
-            self.bot.send_message(
+            await self.bot.send_message(
                 chat_id=self.config['chat_id'],
                 text=message,
                 parse_mode='HTML'
@@ -140,7 +140,7 @@ class PriceMonitor:
         except Exception as e:
             self.logger.error("Error sending notification: %s", e)
 
-    def check_price_changes(self):
+    async def check_price_changes(self):
         """Проверка изменений цены и market cap"""
         try:
             previous_data = self.load_data()
@@ -182,7 +182,7 @@ class PriceMonitor:
                 notification_message += f"📊 Market Cap Change: {mcap_change:.2f}%\n"
 
             if should_notify:
-                self.send_notification(notification_message)
+                await self.send_notification(notification_message)
                 # Обновляем точку отсчета
                 self.save_data({
                     'price': current_price,
@@ -204,18 +204,20 @@ class PriceMonitor:
             self.logger.error("Error in check cycle: %s", e)
             raise
 
-    def run(self):
+    async def run(self):
         """Основной цикл работы бота"""
         self.logger.info("Starting price monitor...")
         
         while True:
             try:
-                self.check_price_changes()
-                time.sleep(self.config['check_interval'])
+                await self.check_price_changes()
+                await asyncio.sleep(self.config['check_interval'])
             except Exception as e:
                 self.logger.error("Error in main loop: %s", e)
-                time.sleep(60)  # Ждем минуту перед повторной попыткой
+                await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
 
 if __name__ == "__main__":
+    import asyncio
+    
     monitor = PriceMonitor()
-    monitor.run()
+    asyncio.run(monitor.run())
